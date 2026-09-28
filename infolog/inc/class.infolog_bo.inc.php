@@ -26,6 +26,13 @@ class infolog_bo
 	 */
 	const ACL_UNDELETE = Acl::CUSTOM1;
 
+	/**
+	 * $touch_modified value for write(): only touch the modification date, keep the modifier
+	 *
+	 * Used to update the parent, if one of its children changed.
+	 */
+	const TOUCH_MODIFIED_DATE_ONLY = 3;
+
 	var $enums;
 	var $status;
 	/**
@@ -989,14 +996,15 @@ class infolog_bo
 	*
 	* @param array &$values values to write
 	* @param boolean $check_defaults = true check and set certain defaults
-	* @param boolean|int $touch_modified = true touch the modification date and sets the modifier's user-id, 2: only modifier
+	* @param boolean|int $touch_modified = true touch the modification date and sets the modifier's user-id, 2: only modifier,
+	*	self::TOUCH_MODIFIED_DATE_ONLY (3): only modification date, also writes an otherwise unchanged entry
 	* @param boolean $user2server = true conversion between user- and server-time necessary
 	* @param boolean $skip_notification = false true = do NOT send notification, false (default) = send notifications
 	* @param boolean $throw_exception = false Throw an exception (if required fields are not set)
 	* @param string $purge_cfs = null null=dont, 'ical'=only iCal X-properties (cfs name starting with "#"), 'all'=all cfs
 	* @param boolean $ignore_acl =true
 	*
-	* @return int|boolean info_id on a successfull write or false
+	* @return int|boolean info_id on a successfull write (or of an existing entry without changes) or false
 	*/
 	function write(&$values_in, $check_defaults=true, $touch_modified=true, $user2server=true,
 		$skip_notification=false, $throw_exception=false, $purge_cfs=null, $ignore_acl=false)
@@ -1013,6 +1021,7 @@ class infolog_bo
 		if ($values['info_id'])
 		{
 			$old = $this->read($values['info_id'], false, 'server', $ignore_acl);
+			$old_server = $old;	// $old gets converted to user-time for status only updates
 		}
 		else
 		{
@@ -1203,6 +1212,15 @@ class infolog_bo
 			$this->time2time($values);
 		}
 
+		// Saving an existing entry without any change is a no-op: do NOT touch modification date and modifier,
+		// which would move the entry to the top of the list, and do NOT update the parent.
+		// $to_write and $old_server are both in server-time, so no date is changed by a timezone conversion.
+		if (!empty($old_server) && $touch_modified !== self::TOUCH_MODIFIED_DATE_ONLY && !$purge_cfs &&
+			!$this->write_changes_entry($to_write, $old_server))
+		{
+			return (int)$old_server['info_id'];
+		}
+
 		if ($touch_modified && $touch_modified !== 2 || !$values['info_datemodified'])
 		{
 			// Should only an entry be updated which includes the original modification date?
@@ -1217,7 +1235,7 @@ class infolog_bo
 				++$values['info_etag'];
 			}
 		}
-		if ($touch_modified || !$values['info_modifier'])
+		if ($touch_modified && $touch_modified !== self::TOUCH_MODIFIED_DATE_ONLY || !$values['info_modifier'])
 		{
 			$values['info_modifier'] = $to_write['info_modifier'] = $this->so->user;
 		}
@@ -1340,14 +1358,108 @@ class infolog_bo
 			// merge changes (keeping extra values from the UI)
 			$values_in = array_merge($values_in, $values);
 
-			// Update modified timestamp of parent
+			// Update modified timestamp of parent, but keep its modifier, as the parent itself was not changed.
+			// Going through write() keeps the push to the clients (Link::notify_update) and updates the parent's parent too.
 			if($values['info_id_parent'] && $touch_modified)
 			{
 				$parent = $this->read($values['info_id_parent'], true, 'server', true);
-				$this->write($parent, false, true, false, true, false, null, $ignore_acl);
+				$this->write($parent, false, self::TOUCH_MODIFIED_DATE_ONLY, false, true, false, null, $ignore_acl);
 			}
 		}
 		return $info_id;
+	}
+
+	/**
+	 * Check if writing $to_write would change the stored entry $old
+	 *
+	 * Compares the fields tracked in the history, the other columns and custom fields, plus the
+	 * changes of links write_check_links() would do. Fields missing in $to_write are not written,
+	 * so they can not change. If in doubt, the entry counts as changed.
+	 *
+	 * @param array $to_write values to write in server-time
+	 * @param array $old stored entry in server-time, as read by read($info_id, false, 'server')
+	 * @return boolean true if the entry would change, false if writing it would be a no-op
+	 */
+	protected function write_changes_entry(array $to_write, array $old)
+	{
+		if (!is_object($this->tracking))
+		{
+			$this->tracking = new infolog_tracking($this);
+		}
+		if ($this->tracking->changed_fields($to_write + $old, $old))
+		{
+			return true;
+		}
+		// columns not tracked in the history and custom fields unknown to the tracking, eg. iCal X-properties
+		foreach($to_write as $name => $value)
+		{
+			if (!is_string($name) || !in_array($name, ['info_confirm', 'info_custom_from', 'info_uid', 'caldav_name']) &&
+				!(strpos($name, '#') === 0 && !isset($this->tracking->field2history[$name])))
+			{
+				continue;
+			}
+			if (empty($value) && empty($old[$name]))
+			{
+				continue;	// treat all sorts of empty equally
+			}
+			if (is_array($value) || is_array($old[$name] ?? null) || (string)$value !== (string)($old[$name] ?? ''))
+			{
+				return true;
+			}
+		}
+		// links or attachments to add, only used for entries not yet saved, but new links are a change
+		if (!empty($to_write['link_to']['to_id']) && is_array($to_write['link_to']['to_id']))
+		{
+			return true;
+		}
+		// write_check_links() does nothing without edit rights, eg. for a status only update
+		if (!$this->check_access($to_write, Acl::EDIT))
+		{
+			return false;
+		}
+		// project changed: write_check_links() unlinks the old and links the new one
+		if ((string)($to_write['pm_id'] ?? '') !== (string)($to_write['old_pm_id'] ?? ''))
+		{
+			return true;
+		}
+		// primary link (contact): compare what write_check_links() would store with the current primary link
+		$old_contact = '';
+		if ($old['info_link_id'] > 0 && ($link = Link::get_link($old['info_link_id'])))
+		{
+			$nr = $link['link_app1'] == 'infolog' && $link['link_id1'] == $old['info_id'] ? '2' : '1';
+			$old_contact = $link['link_app'.$nr].':'.$link['link_id'.$nr];
+		}
+		$contact = $to_write['info_contact'] ?? null;
+		$app = $id = null;
+		if (is_array($contact))
+		{
+			$app = $contact['app'] ?? null;
+			$id = (int)($contact['id'] ?? 0);
+		}
+		elseif (is_string($contact) && strpos($contact, ':'))
+		{
+			list($app, $id) = explode(':', $contact, 2);
+		}
+		if ($app && $id)
+		{
+			// linked entry: gets (re)linked and its title is stored as info_from
+			return $app.':'.$id !== $old_contact || (string)Link::title($app, $id) !== (string)$old['info_from'];
+		}
+		if (is_string($contact) && $contact !== '')
+		{
+			return true;	// something write_check_links() can not handle as a link, better write it
+		}
+		// no linked entry: the free text (search) becomes info_from, a primary link given in info_link_id gets removed
+		if (is_array($contact) && $contact && (($contact['id'] ?? '') !== 'none' || array_key_exists('search', $contact)))
+		{
+			$from = $contact['search'] ?? null;
+		}
+		else
+		{
+			$from = $to_write['info_from'] ?? null;
+		}
+		return $old_contact !== '' || (int)($to_write['info_link_id'] ?? 0) > 0 ||
+			(string)$from !== (string)($old['info_from'] ?? '');
 	}
 
 	/**
