@@ -1,7 +1,7 @@
 /**
  * Test file for Etemplate webComponent Date
  */
-import {assert, elementUpdated, fixture, html} from '@open-wc/testing';
+import {aTimeout, assert, elementUpdated, fixture, html} from '@open-wc/testing';
 import * as sinon from 'sinon';
 import {Et2DateTime} from "../Et2DateTime";
 import {Et2Textbox} from "../../Et2Textbox/Et2Textbox";
@@ -76,6 +76,76 @@ describe("DateTime widget", () =>
 		await elementUpdated(element);
 		assert.equal(element._inputNode.value, "");
 		assert.equal(element.get_value(), "");
+	});
+
+	/**
+	 * A value the user did not change has to come back unchanged, with its seconds and not rounded to
+	 * minuteIncrement, eg. a date completed the server set.  Only a change by the user gets rounded.
+	 *
+	 * Pass criteria: getValue() returns exactly the value set, unless the value is changed - which gets
+	 * rounded to the default minuteIncrement of 5.
+	 */
+	describe("Keeps a value the user did not change", () =>
+	{
+		// seconds, and minutes not a multiple of the default minuteIncrement of 5
+		const test_value = "2008-09-22T12:34:56Z";
+
+		it("keeps the seconds", async() =>
+		{
+			element.set_value(test_value);
+			await elementUpdated(element);
+
+			assert.equal(element.getValue(), test_value);
+		});
+
+		it("does not round the value when flatpickr starts", async() =>
+		{
+			element.set_value(test_value);
+			// flatpickr starts on the first focus or click, and calls onReady
+			await element.init();
+			await elementUpdated(element);
+
+			assert.equal(element.getValue(), test_value);
+		});
+
+		it("keeps the value when the displayed value is parsed again", async() =>
+		{
+			element.set_value(test_value);
+			await element.init();
+
+			// What flatpickr does, when the input loses the focus: parse the displayed value, which has no seconds
+			element._instance.setDate(element._instance.altInput.value, true, element._instance.config.altFormat);
+			await aTimeout(10);
+
+			assert.equal(element.getValue(), test_value);
+			assert.isFalse(element.isDirty(), "an unchanged value is not dirty");
+		});
+
+		it("rounds a changed value to minuteIncrement", async() =>
+		{
+			element.set_value(test_value);
+			await element.init();
+			const change = sinon.spy();
+			element.addEventListener("change", change);
+
+			// the user selects 12:37 on the next day
+			element._instance.setDate(new Date(2008, 8, 23, 12, 37), true);
+			await aTimeout(10);
+
+			assert.equal(element.getValue(), "2008-09-23T12:35:00Z");
+			assert.isTrue(change.calledOnce, "one change event for a change");
+		});
+
+		it("returns a new value set in the same minute", async() =>
+		{
+			element.set_value(test_value);
+			await element.init();
+
+			element.set_value("2008-09-22T12:34:10Z");
+			await elementUpdated(element);
+
+			assert.equal(element.getValue(), "2008-09-22T12:34:10Z");
+		});
 	});
 
 	const tz_list = [

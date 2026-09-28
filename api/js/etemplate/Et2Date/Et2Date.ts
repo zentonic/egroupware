@@ -348,7 +348,8 @@ export class Et2Date extends Et2InputWidget(LitFlatpickr)
 	 *
 	 * eg: 11:23 with default 5 minuteIncrement = 11:25
 	 * 16:47 with 30 minuteIncrement = 17:00
-	 * If false (default), it is impossible to have a time that is not a multiple of minuteIncrement.
+	 * If false (default), it is impossible to enter a time that is not a multiple of minuteIncrement.
+	 * A value the user did not change is kept as it is.
 	 * Does not affect scroll, which always goes to nearest multiple.
 	 */
 	@property({type: Boolean})

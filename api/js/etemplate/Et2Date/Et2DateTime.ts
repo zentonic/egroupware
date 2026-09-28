@@ -46,36 +46,80 @@ export class Et2DateTime extends Et2Date
 		options.altFormat = dateFormat + " " + timeFormat;
 		options.enableTime = true;
 		options.time_24hr = this.egw()?.preference("timeformat", "common") == "24";
-		options.dateFormat = "Y-m-dTH:i:00\\Z";
+		// keep the seconds, a value the user did not change has to come back unchanged
+		options.dateFormat = "Y-m-dTH:i:S\\Z";
 		options.defaultHour = new Date().getHours();
 
 		return options;
 	}
 
+	set_value(value)
+	{
+		// getValue() compares with the value set, which must not be the previous one here
+		this._oldValue = null;
+		super.set_value(value);
+	}
+
 	/**
-	 * Change handler setting modelValue for validation
+	 * Get the value, keeping the seconds of a value the user did not change
 	 *
-	 * @returns
+	 * The user sees and edits the value without seconds.  flatpickr drops them, whenever it parses the displayed
+	 * value again, eg. when the input loses the focus or the calendar gets closed.  As long as the displayed value
+	 * is still the one set, return the value set.
+	 */
+	getValue()
+	{
+		const value = super.getValue();
+
+		return value !== this._oldValue && this._displaysValueSet(value) ? this._oldValue : value;
+	}
+
+	/**
+	 * Check if a value (in dateFormat) is displayed like the value set, ie. the user did not change it
+	 *
+	 * @param {string} value
+	 * @returns {boolean}
+	 * @protected
+	 */
+	protected _displaysValueSet(value : string) : boolean
+	{
+		if(!this._instance || !value || !this._oldValue || typeof this._oldValue !== "string")
+		{
+			return false;
+		}
+		const config = this._instance.config;
+		const set = this._instance.parseDate(this._oldValue, config.dateFormat);
+		const current = this._instance.parseDate(value, config.dateFormat);
+
+		return !!set && !!current &&
+			this._instance.formatDate(set, config.altFormat) === this._instance.formatDate(current, config.altFormat);
+	}
+
+	/**
+	 * flatpickr's onChange callback
+	 *
+	 * Round to minuteIncrement, if the user changed the value.  Not if flatpickr only parsed the displayed value
+	 * again, and not when flatpickr starts (onReady), which used to round the value without any user action.
+	 *
 	 * @param selectedDates
 	 * @param dateStr
 	 * @param instance
 	 */
-	_updateValueOnChange(selectedDates : Date[], dateStr : string, instance : Instance)
+	_handleCalendarChange(selectedDates : Date[], dateStr : string, instance : Instance)
 	{
-		super._updateValueOnChange(selectedDates, dateStr, instance);
-		if(!this.freeMinuteEntry && dateStr && instance && instance.config.minuteIncrement > 1)
+		const selected = selectedDates.length ? instance.latestSelectedDateObj : null;
+		if(!this.freeMinuteEntry && selected && instance.config.minuteIncrement > 1 &&
+			!this._displaysValueSet(instance.formatDate(selected, instance.config.dateFormat)))
 		{
-			let i = instance.latestSelectedDateObj;
-			const d = i ? i : new Date();
-			const original = d.getMinutes();
-
-			let bound = Math.round(original / instance.config.minuteIncrement) * instance.config.minuteIncrement;
+			const original = selected.getMinutes();
+			const bound = Math.round(original / instance.config.minuteIncrement) * instance.config.minuteIncrement;
 			if(bound != original)
 			{
-				d.setMinutes(bound);
-				instance.setDate(d, false);
+				selected.setMinutes(bound);
+				instance.setDate(selected, false);
 			}
 		}
+		super._handleCalendarChange(selectedDates, dateStr, instance);
 	}
 
 	/**
